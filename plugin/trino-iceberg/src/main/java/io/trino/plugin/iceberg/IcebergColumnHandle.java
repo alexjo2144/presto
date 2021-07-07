@@ -40,6 +40,7 @@ public class IcebergColumnHandle
     private final Type baseType;
     private final Optional<String> comment;
     private final List<String> path;
+    private List<String> fullPath;
 
     @JsonCreator
     public IcebergColumnHandle(
@@ -113,10 +114,13 @@ public class IcebergColumnHandle
 
     public List<String> getFullPath()
     {
-        return ImmutableList.<String>builder()
-                .addAll(getPath())
-                .add(getName())
-                .build();
+        if (fullPath == null) {
+            fullPath = ImmutableList.<String>builder()
+                    .addAll(getPath())
+                    .add(getName())
+                    .build();
+        }
+        return fullPath;
     }
 
     public String getQualifiedName()

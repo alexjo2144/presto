@@ -15,11 +15,14 @@ package io.trino.plugin.iceberg;
 
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
+import io.airlift.units.DataSize;
 import io.trino.Session;
 import io.trino.metadata.Metadata;
 import io.trino.metadata.QualifiedObjectName;
 import io.trino.metadata.TableHandle;
+import io.trino.operator.OperatorStats;
 import io.trino.plugin.hive.HdfsEnvironment;
+import io.trino.spi.QueryId;
 import io.trino.spi.connector.ColumnHandle;
 import io.trino.spi.connector.Constraint;
 import io.trino.spi.connector.ConstraintApplicationResult;
@@ -34,6 +37,7 @@ import io.trino.testing.BaseConnectorTest;
 import io.trino.testing.MaterializedResult;
 import io.trino.testing.MaterializedRow;
 import io.trino.testing.QueryRunner;
+import io.trino.testing.ResultWithQueryId;
 import io.trino.testing.TestingConnectorBehavior;
 import io.trino.testing.sql.TestTable;
 import io.trino.testng.services.Flaky;
@@ -57,6 +61,7 @@ import java.io.OutputStream;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
 import java.util.regex.Matcher;
@@ -68,8 +73,10 @@ import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.collect.ImmutableMap.toImmutableMap;
 import static com.google.common.collect.Iterables.getOnlyElement;
+import static com.google.common.collect.MoreCollectors.onlyElement;
 import static io.trino.plugin.hive.HdfsEnvironment.HdfsContext;
 import static io.trino.plugin.hive.HiveTestUtils.HDFS_ENVIRONMENT;
+import static io.trino.plugin.iceberg.IcebergQueryRunner.ICEBERG_CATALOG;
 import static io.trino.plugin.iceberg.IcebergQueryRunner.createIcebergQueryRunner;
 import static io.trino.plugin.iceberg.IcebergSplitManager.ICEBERG_DOMAIN_COMPACTION_THRESHOLD;
 import static io.trino.spi.predicate.Domain.multipleValues;
@@ -1942,5 +1949,72 @@ public abstract class AbstractTestIcebergConnectorTest
         finally {
             assertUpdate("DROP TABLE IF EXISTS nested_data");
         }
+    }
+
+    @Test
+    // This particular method may or may not be @Flaky. It is annotated since the problem is generic.
+    @Flaky(issue = "https://github.com/trinodb/trino/issues/5201", match = "Failed to read footer of file: HdfsInputFile")
+    public void testProjectionPushdownAfterRename()
+    {
+        String tableName = "projection_pushdown_after_rename";
+        try {
+            assertUpdate("CREATE TABLE " + tableName + "(id int, a ROW(b INT, c ROW (d int)))");
+            assertUpdate("INSERT INTO " + tableName + " VALUES (1, ROW(2, ROW(3))), (11, ROW(12, ROW(13)))", 2);
+            assertUpdate("INSERT INTO " + tableName + " VALUES (21, ROW(22, ROW(23)))", 1);
+
+            @Language("SQL") String expected = "VALUES (11, JSON '{\"b\":12,\"c\":{\"d\":13}}', 13)";
+            assertQuery("SELECT id, CAST(a AS JSON), a.c.d FROM " + tableName + " WHERE a.b = 12", expected);
+            assertUpdate("ALTER TABLE " + tableName + " RENAME COLUMN a TO row_t");
+            assertQuery("SELECT id, CAST(row_t AS JSON), row_t.c.d FROM " + tableName + " WHERE row_t.b = 12", expected);
+        }
+        finally {
+            assertUpdate("DROP TABLE IF EXISTS " + tableName);
+        }
+    }
+
+    @Test
+    // This particular method may or may not be @Flaky. It is annotated since the problem is generic.
+    @Flaky(issue = "https://github.com/trinodb/trino/issues/5201", match = "Failed to read footer of file: HdfsInputFile")
+    public void testProjectionPushdownReadsLessData()
+    {
+        String tableName = "projection_pushdown_reads_less_data";
+        String largeVarchar = "ZZZ".repeat(1000);
+        try {
+            assertUpdate("CREATE TABLE " + tableName + "(id int, a ROW(b VARCHAR, c int))");
+            assertUpdate(
+                    format("INSERT INTO %s VALUES (1, ROW('%s', 3)), (11, ROW('%2$s', 13)), (21, ROW('%2$s', 23)), (31, ROW('%2$s', 33))", tableName, largeVarchar),
+                    4);
+
+            @Language("SQL") String selectQuery = "SELECT a.c FROM " + tableName;
+            Set<Integer> expected = ImmutableSet.of(3, 13, 23, 33);
+
+            ResultWithQueryId<MaterializedResult> result = getDistributedQueryRunner().executeWithQueryId(getSession(), selectQuery);
+            assertEquals(result.getResult().getOnlyColumnAsSet(), expected);
+            DataSize sizeWithPushdown = getOperatorStats(result.getQueryId()).getInputDataSize();
+
+            Session sessionWithoutPushdown = Session.builder(getSession())
+                    .setCatalogSessionProperty(ICEBERG_CATALOG, "projection_pushdown_enabled", "false")
+                    .build();
+            result = getDistributedQueryRunner().executeWithQueryId(sessionWithoutPushdown, selectQuery);
+            assertEquals(result.getResult().getOnlyColumnAsSet(), expected);
+            DataSize sizeWithOutPushdown = getOperatorStats(result.getQueryId()).getInputDataSize();
+
+            assertThat(sizeWithOutPushdown).isGreaterThan(sizeWithPushdown);
+        }
+        finally {
+            assertUpdate("DROP TABLE IF EXISTS " + tableName);
+        }
+    }
+
+    private OperatorStats getOperatorStats(QueryId queryId)
+    {
+        return getDistributedQueryRunner().getCoordinator()
+                .getQueryManager()
+                .getFullQueryInfo(queryId)
+                .getQueryStats()
+                .getOperatorSummaries()
+                .stream()
+                .filter(summary -> summary.getOperatorType().contains("Scan"))
+                .collect(onlyElement());
     }
 }

@@ -84,7 +84,6 @@ import javax.inject.Inject;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -123,6 +122,7 @@ import static io.trino.plugin.iceberg.TypeConverter.ORC_ICEBERG_ID_KEY;
 import static io.trino.spi.StandardErrorCode.NOT_SUPPORTED;
 import static java.lang.StrictMath.toIntExact;
 import static java.lang.String.format;
+import static java.util.Comparator.comparingInt;
 import static java.util.Locale.ENGLISH;
 import static java.util.Objects.requireNonNull;
 import static java.util.stream.Collectors.toList;
@@ -301,7 +301,7 @@ public class IcebergPageSourceProvider
             List<Type> fileReadTypes = new ArrayList<>(columns.size());
             List<ColumnAdaptation> columnAdaptations = new ArrayList<>(columns.size());
             List<IcebergColumnHandle> readColumns = columnProjections
-                    .map(readerColumns -> readerColumns.get().stream().map(IcebergColumnHandle.class::cast).collect(toList()))
+                    .map(readerColumns -> (List<IcebergColumnHandle>) readerColumns.get().stream().map(IcebergColumnHandle.class::cast).collect(toImmutableList()))
                     .orElse(columns);
             for (IcebergColumnHandle column : readColumns) {
                 OrcColumn orcColumn;
@@ -417,7 +417,7 @@ public class IcebergPageSourceProvider
                 .collect(toImmutableMap(Map.Entry::getKey, entry -> toIntExact(entry.getValue())));
         // Order the columns in path depth order so existing projections for nested columns can be reused
         List<IcebergColumnHandle> orderedColumns = originalColumnIndexes.keySet().stream()
-                .sorted(Comparator.comparingInt(col -> col.getPath().size()))
+                .sorted(comparingInt(col -> col.getPath().size()))
                 .collect(toImmutableList());
 
         ImmutableList.Builder<ColumnHandle> projectedColumns = ImmutableList.builder();
@@ -434,45 +434,6 @@ public class IcebergPageSourceProvider
             }
 
             projectedColumns.add(column);
-            mappedColumnIndices.put(column.getFullPath(), projectedColumnIndex);
-            outputColumnMapping[columnIndex] = projectedColumnIndex;
-            projectedColumnIndex++;
-        }
-
-        return Optional.of(new ReaderColumns(projectedColumns.build(), ImmutableList.copyOf(outputColumnMapping)));
-    }
-
-    /**
-     * Creates a mapping between the input {@param columns} and base columns if required.
-     */
-    public static Optional<ReaderColumns> projectColumnsForParquet(List<IcebergColumnHandle> columns)
-    {
-        // No projection is required if all columns are base columns
-        if (columns.stream().allMatch(IcebergColumnHandle::isBaseColumn)) {
-            return Optional.empty();
-        }
-
-        Map<IcebergColumnHandle, Integer> originalColumnIndexes = Streams.mapWithIndex(columns.stream(), Map::entry)
-                .collect(toImmutableMap(Map.Entry::getKey, entry -> toIntExact(entry.getValue())));
-        // Order the columns in path depth order so existing projections for nested columns can be reused
-        List<IcebergColumnHandle> orderedColumns = originalColumnIndexes.keySet().stream()
-                .sorted(Comparator.comparingInt(col -> col.getPath().size()))
-                .collect(toImmutableList());
-
-        ImmutableList.Builder<ColumnHandle> projectedColumns = ImmutableList.builder();
-        Integer[] outputColumnMapping = new Integer[columns.size()];
-        Map<List<String>, Integer> mappedColumnIndices = new HashMap<>();
-        int projectedColumnIndex = 0;
-
-        for (IcebergColumnHandle column : orderedColumns) {
-            Optional<Integer> existingProjectedColumn = findExistingProjection(mappedColumnIndices, column);
-            int columnIndex = originalColumnIndexes.get(column);
-            if (existingProjectedColumn.isPresent()) {
-                outputColumnMapping[columnIndex] = existingProjectedColumn.get();
-                continue;
-            }
-
-            projectedColumns.add(column.getBaseColumn());
             mappedColumnIndices.put(column.getFullPath(), projectedColumnIndex);
             outputColumnMapping[columnIndex] = projectedColumnIndex;
             projectedColumnIndex++;
@@ -502,26 +463,6 @@ public class IcebergPageSourceProvider
                 .forEach(orcColumn -> {
                     columnMap.put(getFieldId(orcColumn), orcColumn);
                     columnMap.putAll(mapIdsToOrcFileColumns(orcColumn.getNestedColumns()));
-                });
-        return columnMap.build();
-    }
-
-    private static Map<Integer, org.apache.parquet.schema.Type> mapIdsToParquetType(List<org.apache.parquet.schema.Type> fields)
-    {
-        ImmutableMap.Builder<Integer, org.apache.parquet.schema.Type> columnMap = ImmutableMap.builder();
-        fields.stream()
-                .filter(field -> field.getId() != null)
-                .forEach(field -> {
-                    columnMap.put(field.getId().intValue(), field);
-                    if (!field.isPrimitive()) {
-                        GroupType groupType = field.asGroupType();
-                        columnMap.putAll(mapIdsToParquetType(groupType.getFields())
-                                .entrySet()
-                                .stream()
-                                .collect(toMap(
-                                        Map.Entry::getKey,
-                                        entry -> new GroupType(field.getRepetition(), field.getName(), ImmutableList.of(entry.getValue())))));
-                    }
                 });
         return columnMap.build();
     }
@@ -629,7 +570,7 @@ public class IcebergPageSourceProvider
 
             Optional<ReaderColumns> columnProjections = projectColumnsForParquet(regularColumns);
             List<IcebergColumnHandle> readColumns = columnProjections
-                    .map(readerColumns -> readerColumns.get().stream().map(IcebergColumnHandle.class::cast).collect(toList()))
+                    .map(readerColumns -> (List<IcebergColumnHandle>) readerColumns.get().stream().map(IcebergColumnHandle.class::cast).collect(toImmutableList()))
                     .orElse(regularColumns);
 
             List<org.apache.parquet.schema.Type> parquetFields = readColumns.stream()
@@ -709,6 +650,73 @@ public class IcebergPageSourceProvider
             }
             throw new TrinoException(ICEBERG_CANNOT_OPEN_SPLIT, message, e);
         }
+    }
+
+    /**
+     * Creates a mapping between the input {@param columns} and base columns if required.
+     * The difference between this and the Orc version is that the projected columns for Parquet must be the base columns. Orc does not have this restriction.
+     */
+    public static Optional<ReaderColumns> projectColumnsForParquet(List<IcebergColumnHandle> columns)
+    {
+        // No projection is required if all columns are base columns
+        if (columns.stream().allMatch(IcebergColumnHandle::isBaseColumn)) {
+            return Optional.empty();
+        }
+
+        Map<IcebergColumnHandle, Integer> originalColumnIndexes = Streams.mapWithIndex(columns.stream(), Map::entry)
+                .collect(toImmutableMap(Map.Entry::getKey, entry -> toIntExact(entry.getValue())));
+        // Order the columns in path depth order so existing projections for nested columns can be reused
+        List<IcebergColumnHandle> orderedColumns = originalColumnIndexes.keySet().stream()
+                .sorted(comparingInt(col -> col.getPath().size()))
+                .collect(toImmutableList());
+
+        ImmutableList.Builder<ColumnHandle> projectedColumns = ImmutableList.builder();
+        Integer[] outputColumnMapping = new Integer[columns.size()];
+        Map<List<String>, Integer> mappedColumnIndices = new HashMap<>();
+        int projectedColumnIndex = 0;
+
+        for (IcebergColumnHandle column : orderedColumns) {
+            Optional<Integer> existingProjectedColumn = findExistingProjection(mappedColumnIndices, column);
+            int columnIndex = originalColumnIndexes.get(column);
+            if (existingProjectedColumn.isPresent()) {
+                outputColumnMapping[columnIndex] = existingProjectedColumn.get();
+                continue;
+            }
+
+            projectedColumns.add(column.getBaseColumn());
+            mappedColumnIndices.put(column.getFullPath(), projectedColumnIndex);
+            outputColumnMapping[columnIndex] = projectedColumnIndex;
+            projectedColumnIndex++;
+        }
+
+        return Optional.of(new ReaderColumns(projectedColumns.build(), ImmutableList.copyOf(outputColumnMapping)));
+    }
+
+    /**
+     * Maps the Iceberg field id to the Parquet schema type. For nested columns this includes the necessary GroupTypes for the reader to reference the nested column.
+     * Nested types are separated so they can be independently referenced for projection pushdown by their individual iceberg field ids.
+     */
+    private static Map<Integer, org.apache.parquet.schema.Type> mapIdsToParquetType(List<org.apache.parquet.schema.Type> fields)
+    {
+        ImmutableMap.Builder<Integer, org.apache.parquet.schema.Type> columnMap = ImmutableMap.builder();
+        fields.stream()
+                .filter(field -> field.getId() != null)
+                .forEach(field -> {
+                    // Add one entry for the top level type
+                    columnMap.put(field.getId().intValue(), field);
+                    if (!field.isPrimitive()) {
+                        // Add an entry for each of the children, while preserving the nested structure
+                        GroupType groupType = field.asGroupType();
+                        columnMap.putAll(mapIdsToParquetType(groupType.getFields())
+                                .entrySet()
+                                .stream()
+                                .collect(toMap(
+                                        Map.Entry::getKey,
+                                        // Preserve the parent type details so the schema can be constructed from the root of the type tree
+                                        entry -> new GroupType(field.getRepetition(), field.getName(), ImmutableList.of(entry.getValue())))));
+                    }
+                });
+        return columnMap.build();
     }
 
     private static TupleDomain<ColumnDescriptor> getParquetTupleDomain(Map<List<String>, RichColumnDescriptor> descriptorsByPath, TupleDomain<IcebergColumnHandle> effectivePredicate)

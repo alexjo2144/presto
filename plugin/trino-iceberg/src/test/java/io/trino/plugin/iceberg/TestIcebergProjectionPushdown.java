@@ -39,6 +39,7 @@ import io.trino.spi.security.PrincipalType;
 import io.trino.sql.planner.assertions.BasePushdownPlanTest;
 import io.trino.testing.LocalQueryRunner;
 import org.testng.annotations.AfterClass;
+import org.testng.annotations.DataProvider;
 import org.testng.annotations.Test;
 
 import java.io.File;
@@ -60,10 +61,11 @@ import static io.trino.sql.planner.assertions.PlanMatchPattern.project;
 import static io.trino.sql.planner.assertions.PlanMatchPattern.tableScan;
 import static io.trino.sql.planner.plan.JoinNode.Type.INNER;
 import static io.trino.testing.TestingSession.testSessionBuilder;
+import static io.trino.testing.sql.TestTable.randomTableSuffix;
 import static java.lang.String.format;
 import static org.testng.Assert.assertTrue;
 
-public class TestIcebergOrcProjectionPushdown
+public class TestIcebergProjectionPushdown
         extends BasePushdownPlanTest
 {
     private static final String CATALOG = "iceberg";
@@ -116,14 +118,44 @@ public class TestIcebergOrcProjectionPushdown
         }
     }
 
-    @Test
-    public void testDereferencePushdown()
+    @DataProvider(name = "format")
+    public static Object[][] formatProvider()
     {
-        String testTable = "test_simple_projection_pushdown";
+        return new Object[][] {{"PARQUET"}, {"ORC"}};
+    }
+
+    @Test(dataProvider = "format")
+    public void testPushdownDisabled(String format)
+    {
+        String testTable = "test_disabled_pushdown" + randomTableSuffix();
+
+        Session session = Session.builder(getQueryRunner().getDefaultSession())
+                .setCatalogSessionProperty(CATALOG, "projection_pushdown_enabled", "false")
+                .build();
+
+        getQueryRunner().execute(format(
+                "CREATE TABLE %s (col0) WITH (format = '%s') AS" +
+                        " SELECT cast(row(5, 6) as row(a bigint, b bigint)) AS col0 WHERE false",
+                testTable,
+                format));
+
+        assertPlan(
+                format("SELECT col0.a expr_a, col0.b expr_b FROM %s", testTable),
+                session,
+                any(
+                        project(
+                                ImmutableMap.of("expr", expression("col0[1]"), "expr_2", expression("col0[2]")),
+                                tableScan(testTable, ImmutableMap.of("col0", "col0")))));
+    }
+
+    @Test(dataProvider = "format")
+    public void testDereferencePushdown(String format)
+    {
+        String testTable = "test_simple_projection_pushdown" + randomTableSuffix();
         QualifiedObjectName completeTableName = new QualifiedObjectName(CATALOG, SCHEMA, testTable);
 
         getQueryRunner().execute(format(
-                "CREATE TABLE %s (col0, col1) with (partitioning = ARRAY['col1']) AS" +
+                "CREATE TABLE %s (col0, col1) with (partitioning = ARRAY['col1'], format = '" + format + "') AS" +
                         " SELECT cast(row(5, 6) as row(x bigint, y bigint)) AS col0, 5 AS col1 WHERE false",
                 testTable));
 
