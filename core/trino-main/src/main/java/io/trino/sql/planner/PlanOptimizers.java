@@ -799,6 +799,8 @@ public class PlanOptimizers
                         .add(new PushLimitIntoTableScan(metadata))
                         .add(new SingleDistinctAggregationToGroupBy())
                         .add(new MultipleDistinctAggregationToMarkDistinct())
+                        .addAll(projectionPushdownRules)
+                        .add(new PushProjectionIntoTableScan(metadata, typeAnalyzer, scalarStatsCalculator))
                         .add(new PushAggregationIntoTableScan(metadata))
                         .build()));
         builder.add(new OptimizeMixedDistinctAggregations(metadata));

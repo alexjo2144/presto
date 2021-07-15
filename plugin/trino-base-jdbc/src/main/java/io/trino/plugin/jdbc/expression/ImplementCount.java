@@ -70,7 +70,7 @@ public class ImplementCount
     {
         Variable input = captures.get(INPUT);
         JdbcColumnHandle columnHandle = (JdbcColumnHandle) context.getAssignment(input.getName());
-        String distinct = aggregateFunction.isDistinct() ? "distinct " : "";
+        String distinct = aggregateFunction.isDistinct() ? "DISTINCT " : "";
         verify(aggregateFunction.getOutputType() == BIGINT);
 
         return Optional.of(new JdbcExpression(
